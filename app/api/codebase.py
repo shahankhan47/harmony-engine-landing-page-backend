@@ -1,5 +1,8 @@
 import json
 from fastapi import APIRouter, Form, HTTPException, Query, Response
+import time
+import asyncio
+from typing import Dict, Any
 
 from app.db.codebase import get_executive_summary_from_db, get_project_diagrams_from_db
 from app.db.codebase import get_files_list, get_file_summary
@@ -45,73 +48,126 @@ async def get_project_diagram(
 """
     Retrieve a list of files with summaries for the specified project_id.
 """
+_PROJECT_FILES_CACHE: Dict[str, Dict[str, Any]] = {}
+_CACHE_LOCK = asyncio.Lock()
+
+# Set to None for infinite cache (recommended for your case)
+_CACHE_TTL_SECONDS = None  # or e.g. 300
+
 @router.get(
     "/projects/{project_id}/files",
     description="Retrieve all files for a project including summary, content, and snippet"
 )
 async def get_project_files_with_details(project_id: str):
-    conn = None
-    try:
-        conn = await get_vector_db_connection()
+    now = time.time()
 
-        # Step 1: Check project embeddings existence
-        count_query = "SELECT COUNT(*) FROM embeddings WHERE project_id = $1"
-        embeddings_count = await conn.fetchval(count_query, project_id)
-        if embeddings_count == 0:
-            return {"project_id": project_id, "files": []}
+    # -----------------------------
+    # CACHE HIT (FAST PATH)
+    # -----------------------------
+    cached = _PROJECT_FILES_CACHE.get(project_id)
+    if cached:
+        if cached["expires_at"] is None or cached["expires_at"] > now:
+            return cached["data"]
 
-        # Step 2: Fetch latest version of each file with full data
-        # DISTINCT ON ensures we get only the newest entry per file_path
-        files_query = """
-            SELECT DISTINCT ON (file_path)
-                file_path,
-                file_name,
-                summary,
-                content
-            FROM embeddings
-            WHERE project_id = $1
-            ORDER BY file_path ASC, created_at DESC
-        """
+    # -----------------------------
+    # CACHE MISS (LOCKED)
+    # -----------------------------
+    async with _CACHE_LOCK:
 
-        records = await conn.fetch(files_query, project_id)
+        # Double-check cache after acquiring lock
+        cached = _PROJECT_FILES_CACHE.get(project_id)
+        if cached:
+            if cached["expires_at"] is None or cached["expires_at"] > now:
+                return cached["data"]
 
-        files = []
-        for record in records:
-            file_path = record.get("file_path", "") or ""
-            file_name = record.get("file_name", "") or ""
-            summary = record.get("summary", "") or ""
-            content = record.get("content", "") or ""
+        conn = None
+        try:
+            conn = await get_vector_db_connection()
 
-            # Prepare summary snippet
-            if summary.strip():
-                snippet = summary.strip()
+            # Step 1: Check if embeddings exist
+            count_query = "SELECT COUNT(*) FROM embeddings WHERE project_id = $1"
+            embeddings_count = await conn.fetchval(count_query, project_id)
+
+            if embeddings_count == 0:
+                result = {
+                    "project_id": project_id,
+                    "files": []
+                }
             else:
-                snippet = (content[:200] + "...") if len(content) > 200 else content
+                # Step 2: Fetch latest version of each file
+                files_query = """
+                    SELECT DISTINCT ON (file_path)
+                        file_path,
+                        file_name,
+                        summary,
+                        content
+                    FROM embeddings
+                    WHERE project_id = $1
+                    ORDER BY file_path ASC, created_at DESC
+                """
 
-            try:
-                encoded_id = encode_path(file_path)
-            except Exception as enc_e:
-                print(f"Warning: Could not encode path '{file_path}'. Skipping. Error: {enc_e}")
-                continue
+                records = await conn.fetch(files_query, project_id)
 
-            files.append({
-                "id": encoded_id,
-                "file_path": file_path,
-                "file_name": file_name,
-                "summary_snippet": snippet,
-                "summary": summary or None,
-                "content": content or None
-            })
+                files = []
+                for record in records:
+                    file_path = record.get("file_path") or ""
+                    file_name = record.get("file_name") or ""
+                    summary = record.get("summary") or ""
+                    content = record.get("content") or ""
 
-        return {
-            "project_id": project_id,
-            "files": files
-        }
+                    # Summary snippet logic
+                    if summary.strip():
+                        snippet = summary.strip()
+                    else:
+                        snippet = (
+                            content[:200] + "..."
+                            if len(content) > 200
+                            else content
+                        )
 
-    except Exception as e:
-        print(f"Error in get_project_files_with_details for project_id={project_id}: {str(e)}")
-        return {"project_id": project_id, "files": []}
+                    try:
+                        encoded_id = encode_path(file_path)
+                    except Exception:
+                        # Skip invalid paths safely
+                        continue
 
-    finally:
-        if conn:
-            await conn.close()
+                    files.append({
+                        "id": encoded_id,
+                        "file_path": file_path,
+                        "file_name": file_name,
+                        "summary_snippet": snippet,
+                        "summary": summary or None,
+                        "content": content or None
+                    })
+
+                result = {
+                    "project_id": project_id,
+                    "files": files
+                }
+
+            # -----------------------------
+            # STORE IN CACHE
+            # -----------------------------
+            _PROJECT_FILES_CACHE[project_id] = {
+                "data": result,
+                "expires_at": (
+                    None if _CACHE_TTL_SECONDS is None
+                    else now + _CACHE_TTL_SECONDS
+                )
+            }
+
+            return result
+
+        except Exception as e:
+            print(
+                f"Error in get_project_files_with_details "
+                f"(project_id={project_id}): {e}"
+            )
+            return {
+                "project_id": project_id,
+                "files": []
+            }
+
+        finally:
+            if conn:
+                await conn.close()
